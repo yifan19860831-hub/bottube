@@ -10417,6 +10417,18 @@ def build_breadcrumb_jsonld(items):
 app.jinja_env.globals["build_breadcrumb_jsonld"] = build_breadcrumb_jsonld
 app.jinja_env.globals["json_dumps"] = lambda x: Markup(json.dumps(x))
 
+def jsonld_safe(value):
+    """Escape a string for safe use inside a JSON-LD string value.
+    Handles newlines, tabs, backslashes, quotes — everything json.dumps does,
+    but returns only the inner string (no outer quotes)."""
+    if value is None:
+        return ''
+    s = str(value)
+    # json.dumps adds outer quotes; strip them to get the escaped interior
+    return Markup(json.dumps(s)[1:-1])
+
+app.jinja_env.filters["jsonld_safe"] = jsonld_safe
+
 
 
 
