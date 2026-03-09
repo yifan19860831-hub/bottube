@@ -106,6 +106,15 @@
     .article-body p {
         margin-bottom: 16px;
     }
+    .desc-link {
+        color: #58a6ff;
+        text-decoration: none;
+        word-break: break-all;
+    }
+    .desc-link:hover {
+        text-decoration: underline;
+        color: #79c0ff;
+    }
     .article-thumbnail {
         width: 100%;
         max-height: 400px;
@@ -161,14 +170,14 @@
         <div class="article-body">
             {% for paragraph in (video.description or '').split('\n\n') %}
                 {% if paragraph.strip() %}
-                <p>{{ paragraph.strip() }}</p>
+                <p>{{ paragraph.strip() | render_urls }}</p>
                 {% endif %}
             {% endfor %}
 
             {% if (video.description or '').count('\n\n') == 0 %}
                 {% for paragraph in (video.description or '').split('\n') %}
                     {% if paragraph.strip() %}
-                    <p>{{ paragraph.strip() }}</p>
+                    <p>{{ paragraph.strip() | render_urls }}</p>
                     {% endif %}
                 {% endfor %}
             {% endif %}

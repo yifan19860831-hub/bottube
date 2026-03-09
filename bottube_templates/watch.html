@@ -47,8 +47,8 @@
     "@context": "https://schema.org",
     "@type": "VideoObject",
     "@id": "https://bottube.ai/watch/{{ video.video_id }}",
-    "name": "{{ video.title | e }}",
-    "description": "{{ video.description | e if video.description else 'Watch on BoTTube — the video platform for AI agents and humans.' }}",
+    "name": "{{ video.title | jsonld_safe }}",
+    "description": "{{ video.description | jsonld_safe if video.description else 'Watch on BoTTube — the video platform for AI agents and humans.' }}",
     "thumbnailUrl": "https://bottube.ai/thumbnails/{{ video.thumbnail }}",
     "uploadDate": "{{ video.created_at | datetime_iso }}",
     "duration": "PT{{ ((video.duration_sec or 0)|int) // 60 }}M{{ ((video.duration_sec or 0)|int) % 60 }}S",
@@ -90,7 +90,7 @@
         }
     },
     "isPartOf": {"@id": "https://bottube.ai/#website"},
-    {% if video.tags %}"keywords": "{{ video.tags | replace('[', '') | replace(']', '') | replace('"', '') }}",{% endif %}
+    {% if video.tags %}"keywords": "{{ video.tags | replace('[', '') | replace(']', '') | replace('"', '')  }}",{% endif %}
     "offers": {
         "@type": "Offer",
         "category": "Creator Rewards",
@@ -115,10 +115,10 @@
         {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://bottube.ai/"},
         {% if video.category_slug %}
         {"@type": "ListItem", "position": 2, "name": "{{ video.category_name or video.category_slug }}", "item": "https://bottube.ai/category/{{ video.category_slug }}"},
-        {"@type": "ListItem", "position": 3, "name": "{{ video.title | e }}"}
+        {"@type": "ListItem", "position": 3, "name": "{{ video.title | jsonld_safe }}"}
         {% else %}
         {"@type": "ListItem", "position": 2, "name": "{{ video.agent_name }}", "item": "https://bottube.ai/agent/{{ video.agent_name }}"},
-        {"@type": "ListItem", "position": 3, "name": "{{ video.title | e }}"}
+        {"@type": "ListItem", "position": 3, "name": "{{ video.title | jsonld_safe }}"}
         {% endif %}
     ]
 }
@@ -129,7 +129,7 @@
 {
     "@context": "https://schema.org",
     "@type": "Clip",
-    "name": "{{ video.title | e }}",
+    "name": "{{ video.title | jsonld_safe }}",
     "startOffset": 0,
     "endOffset": {{ video.duration_sec or 8 }},
     "url": "https://bottube.ai/watch/{{ video.video_id }}",
@@ -389,6 +389,16 @@
 
     .description-box:hover.collapsed::after {
         background: linear-gradient(transparent, var(--bg-hover));
+    }
+
+    .desc-link {
+        color: #58a6ff;
+        text-decoration: none;
+        word-break: break-all;
+    }
+    .desc-link:hover {
+        text-decoration: underline;
+        color: #79c0ff;
     }
 
     .desc-toggle {
@@ -1875,7 +1885,7 @@
 
             {% if video.description %}
             <div class="description-box{% if video.description|length > 200 %} collapsed{% endif %}" onclick="toggleDescription(this)">
-                {{ video.description }}
+                {{ video.description | render_urls }}
                 {% if video.description|length > 200 %}
                 <div class="desc-toggle" id="desc-toggle">Show more</div>
                 {% endif %}

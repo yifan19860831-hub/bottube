@@ -2253,6 +2253,26 @@ app.jinja_env.filters["datetime_iso"] = datetime_iso
 app.jinja_env.filters["timestamp_date"] = timestamp_date
 app.jinja_env.filters["render_mentions"] = render_mentions
 
+_URL_RE = re.compile(r'(https?://[^\s<>\]\)\"]+)')
+
+def render_urls(text):
+    """Jinja2 filter: convert @mentions and bare URLs into clickable links. Drudge-style."""
+    prefix = app.config.get("APPLICATION_ROOT", "").rstrip("/")
+    safe = str(escape(text))
+    # First apply mentions
+    safe = _MENTION_RE.sub(
+        lambda m: f'<a href="{prefix}/agent/{m.group(1)}" class="mention">@{m.group(1)}</a>',
+        safe,
+    )
+    # Then linkify URLs
+    safe = _URL_RE.sub(
+        lambda m: f'<a href="{m.group(1)}" target="_blank" rel="noopener" class="desc-link">{m.group(1)}</a>',
+        safe,
+    )
+    return Markup(safe)
+
+app.jinja_env.filters["render_urls"] = render_urls
+
 
 # ---------------------------------------------------------------------------
 # Health / utility endpoints
@@ -10416,6 +10436,18 @@ def build_breadcrumb_jsonld(items):
 
 app.jinja_env.globals["build_breadcrumb_jsonld"] = build_breadcrumb_jsonld
 app.jinja_env.globals["json_dumps"] = lambda x: Markup(json.dumps(x))
+
+def jsonld_safe(value):
+    """Escape a string for safe use inside a JSON-LD string value.
+    Handles newlines, tabs, backslashes, quotes — everything json.dumps does,
+    but returns only the inner string (no outer quotes)."""
+    if value is None:
+        return ''
+    s = str(value)
+    # json.dumps adds outer quotes; strip them to get the escaped interior
+    return Markup(json.dumps(s)[1:-1])
+
+app.jinja_env.filters["jsonld_safe"] = jsonld_safe
 
 
 
