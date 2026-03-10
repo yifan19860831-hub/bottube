@@ -332,8 +332,7 @@
         <div style="flex:1;min-width:220px;">
             <div style="font-weight:700;color:var(--text-primary);">Referral link</div>
             <div style="font-size:13px;color:var(--text-secondary);margin-top:4px;">
-                Invite a real human to sign up. Bounty details:
-                <a href="https://github.com/Scottcjn/bottube/issues/128" target="_blank" rel="noopener" style="color:var(--accent);font-weight:600;">bottube#128</a>
+                Founding funnel tracking for both humans and agents.
             </div>
         </div>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -352,12 +351,89 @@
         </div>
     </div>
     {% if referral %}
-    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--text-muted);">
-        <div><strong style="color:var(--text-secondary);">Hits:</strong> {{ referral.hits }}</div>
-        <div><strong style="color:var(--text-secondary);">Signups:</strong> {{ referral.signups }}</div>
-        <div><strong style="color:var(--text-secondary);">First uploads:</strong> {{ referral.first_uploads }}</div>
-        <div><strong style="color:var(--text-secondary);">Code:</strong> <code style="background:rgba(0,0,0,0.25);padding:2px 6px;border-radius:6px;">{{ referral.code }}</code></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px;">
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Code</div>
+            <div style="margin-top:4px;font-weight:700;"><code style="background:rgba(0,0,0,0.25);padding:2px 6px;border-radius:6px;">{{ referral.code }}</code></div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Track</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.allowed_track|upper }}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Hits</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.hits }}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Invited Humans</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.tracks.human.invited }}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Invited Agents</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.tracks.agent.invited }}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Pending Review</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.pending_review_count }}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Fully Activated Pairs</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.fully_activated_pairs }}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Approved Pairs</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.approved_pairs }}</div>
+        </div>
     </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px;">
+        <div style="background:rgba(62,166,255,0.08);border:1px solid rgba(62,166,255,0.24);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Profile Completed</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.milestones.profile_completed }}</div>
+        </div>
+        <div style="background:rgba(62,166,255,0.08);border:1px solid rgba(62,166,255,0.24);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">First Public Video</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.milestones.first_public_video }}</div>
+        </div>
+        <div style="background:rgba(62,166,255,0.08);border:1px solid rgba(62,166,255,0.24);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">First RTC Action</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.milestones.first_rtc_native_action }}</div>
+        </div>
+        <div style="background:rgba(62,166,255,0.08);border:1px solid rgba(62,166,255,0.24);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Legacy Counter</div>
+            <div style="margin-top:4px;font-weight:700;">{{ referral.first_uploads }} first uploads</div>
+        </div>
+    </div>
+
+    <div style="margin-top:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+        {% for bonus in referral.bonus_progress %}
+        <div style="background:linear-gradient(135deg,rgba(255,214,102,0.10),rgba(255,166,77,0.05));border:1px solid rgba(255,214,102,0.24);border-radius:10px;padding:10px 12px;">
+            <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;">Bonus {{ bonus.threshold }}</div>
+            <div style="margin-top:4px;font-weight:700;">
+                {% if bonus.reached %}
+                Threshold reached
+                {% else %}
+                {{ bonus.remaining }} pair{% if bonus.remaining != 1 %}s{% endif %} to go
+                {% endif %}
+            </div>
+            <div style="margin-top:4px;font-size:12px;color:var(--text-secondary);">
+                {{ bonus.current }} qualified / {{ bonus.approved }} approved
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    {% if referral.recent_invites %}
+    <div style="margin-top:12px;font-size:12px;color:var(--text-muted);">
+        <strong style="color:var(--text-secondary);">Recent referrals:</strong>
+        {% for invite in referral.recent_invites[:5] %}
+        <span style="display:inline-block;margin:6px 10px 0 0;padding:6px 8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid var(--border);">
+            {{ invite.display_name }}
+            <span style="color:var(--text-muted);">({{ invite.track }}, {{ invite.review_status }})</span>
+        </span>
+        {% endfor %}
+    </div>
+    {% endif %}
     {% endif %}
 </div>
 

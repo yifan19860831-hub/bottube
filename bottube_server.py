@@ -112,6 +112,8 @@ AVATAR_TARGET_SIZE = 256  # 256x256
 ALLOWED_VIDEO_EXT = {".mp4", ".webm", ".avi", ".mkv", ".mov"}
 ALLOWED_THUMB_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 COMMENT_TYPES = {"comment", "critique"}
+REFERRAL_TRACKS = {"human", "agent", "both"}
+REFERRAL_BONUS_THRESHOLDS = (3, 5, 10)
 
 APP_VERSION = "1.2.0"
 APP_START_TS = time.time()
@@ -358,6 +360,298 @@ def _normalize_ref_code(raw: str) -> str:
     return code
 
 
+def _normalize_referral_track(raw: str, default: str = "both") -> str:
+    track = (raw or "").strip().lower()
+    if track in REFERRAL_TRACKS:
+        return track
+    return default
+
+
+def _referral_track_for_agent(row: sqlite3.Row | dict | None) -> str:
+    if not row:
+        return "agent"
+    return "human" if int(row["is_human"] or 0) else "agent"
+
+
+def _referral_track_allowed(allowed_track: str, invitee_track: str) -> bool:
+    allowed = _normalize_referral_track(allowed_track, "both")
+    if allowed == "both":
+        return True
+    return allowed == invitee_track
+
+
+def _referral_request_hashes() -> tuple[str, str]:
+    try:
+        ip = _get_client_ip()
+        fp = _fingerprint_ua(
+            ip,
+            ua=request.headers.get("User-Agent", ""),
+            accept_language=request.headers.get("Accept-Language", ""),
+        )
+    except Exception:
+        ip = ""
+        fp = ""
+    ip_hash = hashlib.sha256(ip.encode("utf-8")).hexdigest() if ip else ""
+    fp_hash = hashlib.sha256(fp.encode("utf-8")).hexdigest() if fp else ""
+    return ip_hash, fp_hash
+
+
+def _referral_get_code_row(db: sqlite3.Connection, code: str):
+    ref_code = _normalize_ref_code(code)
+    if not ref_code:
+        return None
+    return db.execute(
+        "SELECT code, agent_id, COALESCE(allowed_track, 'both') AS allowed_track FROM referral_codes WHERE code = ?",
+        (ref_code,),
+    ).fetchone()
+
+
+def _referral_build_summary(db: sqlite3.Connection, agent_id: int, *, include_recent: bool = True) -> dict | None:
+    row = db.execute(
+        """
+        SELECT code, hits, signups, first_uploads, created_at, COALESCE(allowed_track, 'both') AS allowed_track
+        FROM referral_codes
+        WHERE agent_id = ?
+        ORDER BY created_at ASC
+        LIMIT 1
+        """,
+        (agent_id,),
+    ).fetchone()
+    if not row:
+        return None
+
+    invite_rows = db.execute(
+        """
+        SELECT
+            ri.id,
+            ri.invitee_track,
+            ri.source,
+            ri.signup_at,
+            ri.profile_completed_at,
+            ri.profile_completed_ref,
+            ri.first_public_video_at,
+            ri.first_public_video_ref,
+            ri.first_rtc_native_action_at,
+            ri.first_rtc_native_action_ref,
+            ri.fully_activated_at,
+            ri.review_status,
+            ri.reviewed_at,
+            ri.reviewer_note,
+            a.agent_name,
+            a.display_name,
+            a.created_at AS invitee_created_at
+        FROM referral_invites ri
+        JOIN agents a ON a.id = ri.invitee_agent_id
+        WHERE ri.referrer_agent_id = ?
+        ORDER BY ri.signup_at DESC, ri.id DESC
+        """,
+        (agent_id,),
+    ).fetchall()
+
+    tracks = {
+        "human": {"invited": 0, "profile_completed": 0, "first_public_video": 0, "first_rtc_native_action": 0, "fully_activated": 0},
+        "agent": {"invited": 0, "profile_completed": 0, "first_public_video": 0, "first_rtc_native_action": 0, "fully_activated": 0},
+    }
+    milestones = {
+        "profile_completed": 0,
+        "first_public_video": 0,
+        "first_rtc_native_action": 0,
+        "fully_activated": 0,
+    }
+    pending_review_count = 0
+    approved_pairs = 0
+    countable_pairs = 0
+    recent_invites = []
+
+    for invite in invite_rows:
+        track = invite["invitee_track"] if invite["invitee_track"] in ("human", "agent") else "agent"
+        tracks[track]["invited"] += 1
+
+        profile_done = float(invite["profile_completed_at"] or 0) > 0
+        video_done = float(invite["first_public_video_at"] or 0) > 0
+        rtc_done = float(invite["first_rtc_native_action_at"] or 0) > 0
+        fully_done = float(invite["fully_activated_at"] or 0) > 0
+
+        if profile_done:
+            tracks[track]["profile_completed"] += 1
+            milestones["profile_completed"] += 1
+        if video_done:
+            tracks[track]["first_public_video"] += 1
+            milestones["first_public_video"] += 1
+        if rtc_done:
+            tracks[track]["first_rtc_native_action"] += 1
+            milestones["first_rtc_native_action"] += 1
+        if fully_done:
+            tracks[track]["fully_activated"] += 1
+            milestones["fully_activated"] += 1
+
+        review_status = (invite["review_status"] or "pending").strip().lower() or "pending"
+        if review_status == "pending":
+            pending_review_count += 1
+        if fully_done and review_status not in {"rejected", "void"}:
+            countable_pairs += 1
+        if fully_done and review_status == "approved":
+            approved_pairs += 1
+
+        if include_recent:
+            recent_invites.append(
+                {
+                    "id": int(invite["id"]),
+                    "agent_name": invite["agent_name"],
+                    "display_name": invite["display_name"] or invite["agent_name"],
+                    "track": track,
+                    "source": invite["source"] or "",
+                    "signup_at": float(invite["signup_at"] or 0),
+                    "invitee_created_at": float(invite["invitee_created_at"] or 0),
+                    "review_status": review_status,
+                    "reviewed_at": float(invite["reviewed_at"] or 0),
+                    "reviewer_note": invite["reviewer_note"] or "",
+                    "milestones": {
+                        "profile_completed": profile_done,
+                        "first_public_video": video_done,
+                        "first_rtc_native_action": rtc_done,
+                        "fully_activated": fully_done,
+                    },
+                }
+            )
+
+    bonus_progress = [
+        {
+            "threshold": threshold,
+            "current": countable_pairs,
+            "approved": approved_pairs,
+            "remaining": max(threshold - countable_pairs, 0),
+            "reached": countable_pairs >= threshold,
+        }
+        for threshold in REFERRAL_BONUS_THRESHOLDS
+    ]
+
+    return {
+        "code": row["code"],
+        "allowed_track": _normalize_referral_track(row["allowed_track"], "both"),
+        "created_at": float(row["created_at"] or 0),
+        "hits": int(row["hits"] or 0),
+        "signups": int(row["signups"] or 0),
+        "first_uploads": int(row["first_uploads"] or 0),
+        "ref_url": f"https://bottube.ai/r/{row['code']}",
+        "signup_url": f"https://bottube.ai/signup?ref={row['code']}",
+        "tracks": tracks,
+        "milestones": milestones,
+        "pending_review_count": pending_review_count,
+        "fully_activated_pairs": countable_pairs,
+        "approved_pairs": approved_pairs,
+        "bonus_progress": bonus_progress,
+        "recent_invites": recent_invites,
+    }
+
+
+def _referral_refresh_invite_state(db: sqlite3.Connection, invitee_agent_id: int) -> None:
+    invite = db.execute(
+        """
+        SELECT
+            ri.id,
+            ri.profile_completed_at,
+            ri.first_public_video_at,
+            ri.first_rtc_native_action_at,
+            ri.fully_activated_at,
+            a.agent_name
+        FROM referral_invites ri
+        JOIN agents a ON a.id = ri.invitee_agent_id
+        WHERE ri.invitee_agent_id = ?
+        """,
+        (invitee_agent_id,),
+    ).fetchone()
+    if not invite:
+        return
+
+    now = time.time()
+    updates: dict[str, object] = {}
+    profile_completed_at = float(invite["profile_completed_at"] or 0)
+    first_public_video_at = float(invite["first_public_video_at"] or 0)
+    first_rtc_native_action_at = float(invite["first_rtc_native_action_at"] or 0)
+    fully_activated_at = float(invite["fully_activated_at"] or 0)
+
+    if profile_completed_at <= 0 and _quest_progress_count(db, invitee_agent_id, "profile_complete") > 0:
+        updates["profile_completed_at"] = now
+        updates["profile_completed_ref"] = f"/agent/{invite['agent_name']}"
+        profile_completed_at = now
+
+    if first_public_video_at <= 0:
+        first_video = db.execute(
+            """
+            SELECT video_id, created_at
+            FROM videos
+            WHERE agent_id = ? AND COALESCE(is_removed, 0) = 0
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """,
+            (invitee_agent_id,),
+        ).fetchone()
+        if first_video:
+            first_public_video_at = float(first_video["created_at"] or now)
+            updates["first_public_video_at"] = first_public_video_at
+            updates["first_public_video_ref"] = f"/watch/{first_video['video_id']}"
+
+    if first_rtc_native_action_at <= 0:
+        first_tip = db.execute(
+            """
+            SELECT id, video_id, created_at
+            FROM tips
+            WHERE from_agent_id = ? OR to_agent_id = ?
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """,
+            (invitee_agent_id, invitee_agent_id),
+        ).fetchone()
+        if first_tip:
+            first_rtc_native_action_at = float(first_tip["created_at"] or now)
+            updates["first_rtc_native_action_at"] = first_rtc_native_action_at
+            if first_tip["video_id"]:
+                updates["first_rtc_native_action_ref"] = f"/watch/{first_tip['video_id']}"
+            else:
+                updates["first_rtc_native_action_ref"] = "/tips/dashboard"
+
+    if fully_activated_at <= 0 and profile_completed_at > 0 and first_public_video_at > 0 and first_rtc_native_action_at > 0:
+        updates["fully_activated_at"] = max(profile_completed_at, first_public_video_at, first_rtc_native_action_at, now)
+
+    if not updates:
+        return
+
+    updates["updated_at"] = now
+    set_clause = ", ".join(f"{key} = ?" for key in updates)
+    db.execute(
+        f"UPDATE referral_invites SET {set_clause} WHERE invitee_agent_id = ?",
+        list(updates.values()) + [invitee_agent_id],
+    )
+
+
+def _referral_mark_rtc_native_action(
+    db: sqlite3.Connection,
+    agent_id: int,
+    *,
+    evidence_ref: str,
+    occurred_at: float | None = None,
+) -> None:
+    invite = db.execute(
+        "SELECT first_rtc_native_action_at FROM referral_invites WHERE invitee_agent_id = ?",
+        (agent_id,),
+    ).fetchone()
+    if not invite or float(invite["first_rtc_native_action_at"] or 0) > 0:
+        return
+    now = float(occurred_at or time.time())
+    db.execute(
+        """
+        UPDATE referral_invites
+        SET first_rtc_native_action_at = ?,
+            first_rtc_native_action_ref = ?,
+            updated_at = ?
+        WHERE invitee_agent_id = ?
+        """,
+        (now, evidence_ref[:500], time.time(), agent_id),
+    )
+    _referral_refresh_invite_state(db, agent_id)
+
+
 def _referral_touch_hit(db, code: str):
     """Increment referral hit counters (best-effort)."""
     if not code:
@@ -415,33 +709,104 @@ def _referral_touch_hit_unique(db, code: str):
         pass
 
 
-def _referral_apply_signup(db, new_agent_id: int, code: str):
-    """Attach referral to new agent and increment referral signup counters (best-effort)."""
-    if not code:
-        return
+def _referral_apply_signup(db, new_agent_id: int, code: str, *, source: str = "signup") -> dict:
+    """Attach referral to an invitee and create milestone tracking state."""
+    result = {"ok": False, "applied": False, "error": "missing_referral_code"}
+    ref_code = _normalize_ref_code(code)
+    if not ref_code:
+        return result
     try:
-        ref = db.execute(
-            "SELECT agent_id FROM referral_codes WHERE code = ?",
-            (code,),
-        ).fetchone()
+        ref = _referral_get_code_row(db, ref_code)
         if not ref:
-            return
+            return {"ok": False, "applied": False, "error": "referral_code_not_found"}
+        invitee = db.execute(
+            """
+            SELECT id, agent_name, is_human, created_at, referred_by_code
+            FROM agents
+            WHERE id = ?
+            """,
+            (new_agent_id,),
+        ).fetchone()
+        if not invitee:
+            return {"ok": False, "applied": False, "error": "invitee_not_found"}
         if int(ref["agent_id"]) == int(new_agent_id):
-            return  # no self-referrals
+            return {"ok": False, "applied": False, "error": "self_referral"}
+
+        invitee_track = _referral_track_for_agent(invitee)
+        if not _referral_track_allowed(ref["allowed_track"], invitee_track):
+            return {
+                "ok": False,
+                "applied": False,
+                "error": "referral_track_not_allowed",
+                "invitee_track": invitee_track,
+                "allowed_track": _normalize_referral_track(ref["allowed_track"], "both"),
+            }
+
         now = time.time()
         cur = db.execute(
             "UPDATE agents SET referred_by_code = ?, referred_at = ? WHERE id = ? AND COALESCE(referred_by_code, '') = ''",
-            (code, now, new_agent_id),
+            (ref_code, now, new_agent_id),
         )
-        # Count signup only if we actually attached the referral.
-        if int(getattr(cur, "rowcount", 0) or 0) > 0:
-            db.execute(
-                "UPDATE referral_codes SET signups = signups + 1, last_signup_at = ? WHERE code = ?",
-                (now, code),
+        if int(getattr(cur, "rowcount", 0) or 0) <= 0:
+            existing = db.execute(
+                "SELECT referred_by_code FROM agents WHERE id = ?",
+                (new_agent_id,),
+            ).fetchone()
+            return {
+                "ok": False,
+                "applied": False,
+                "error": "already_referred",
+                "code": _normalize_ref_code((existing["referred_by_code"] if existing else "") or ""),
+            }
+
+        ip_hash, fp_hash = _referral_request_hashes()
+        db.execute(
+            "UPDATE referral_codes SET signups = signups + 1, last_signup_at = ? WHERE code = ?",
+            (now, ref_code),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO referral_invites (
+                referral_code,
+                referrer_agent_id,
+                invitee_agent_id,
+                invitee_track,
+                source,
+                signup_at,
+                invitee_created_at,
+                signup_ip_hash,
+                signup_fp_hash,
+                review_status,
+                created_at,
+                updated_at
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                ref_code,
+                int(ref["agent_id"]),
+                new_agent_id,
+                invitee_track,
+                (source or "signup")[:64],
+                now,
+                float(invitee["created_at"] or 0),
+                ip_hash,
+                fp_hash,
+                now,
+                now,
+            ),
+        )
+        _referral_refresh_invite_state(db, new_agent_id)
         db.commit()
-    except Exception:
-        pass
+        return {
+            "ok": True,
+            "applied": True,
+            "code": ref_code,
+            "invitee_track": invitee_track,
+            "allowed_track": _normalize_referral_track(ref["allowed_track"], "both"),
+        }
+    except Exception as exc:
+        return {"ok": False, "applied": False, "error": "referral_apply_failed", "details": str(exc)}
 
 
 def _referral_mark_first_upload(db, agent_id: int):
@@ -467,6 +832,7 @@ def _referral_mark_first_upload(db, agent_id: int):
             "UPDATE referral_codes SET first_uploads = first_uploads + 1, last_first_upload_at = ? WHERE code = ?",
             (now, code),
         )
+        _referral_refresh_invite_state(db, agent_id)
         db.commit()
     except Exception:
         pass
@@ -953,6 +1319,7 @@ CREATE TABLE IF NOT EXISTS agents (
     avatar_url TEXT DEFAULT '',
     password_hash TEXT DEFAULT '',
     is_human INTEGER DEFAULT 0,
+    detected_type TEXT DEFAULT '',
     x_handle TEXT DEFAULT '',
     claim_token TEXT DEFAULT '',
     claimed INTEGER DEFAULT 0,
@@ -1221,6 +1588,63 @@ CREATE TABLE IF NOT EXISTS challenges (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status, start_at, end_at);
+
+CREATE TABLE IF NOT EXISTS referral_codes (
+    code TEXT PRIMARY KEY,
+    agent_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    hits INTEGER DEFAULT 0,
+    signups INTEGER DEFAULT 0,
+    first_uploads INTEGER DEFAULT 0,
+    last_hit_at REAL DEFAULT 0,
+    last_signup_at REAL DEFAULT 0,
+    last_first_upload_at REAL DEFAULT 0,
+    allowed_track TEXT DEFAULT 'both',
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+CREATE INDEX IF NOT EXISTS idx_referral_codes_agent ON referral_codes(agent_id);
+
+CREATE TABLE IF NOT EXISTS referral_hit_uniques (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    fp_hash TEXT NOT NULL,
+    last_hit_at REAL NOT NULL,
+    UNIQUE(code, fp_hash),
+    FOREIGN KEY (code) REFERENCES referral_codes(code)
+);
+CREATE INDEX IF NOT EXISTS idx_referral_hit_code ON referral_hit_uniques(code);
+
+CREATE TABLE IF NOT EXISTS referral_invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referral_code TEXT NOT NULL,
+    referrer_agent_id INTEGER NOT NULL,
+    invitee_agent_id INTEGER NOT NULL UNIQUE,
+    invitee_track TEXT NOT NULL DEFAULT 'agent',
+    source TEXT DEFAULT '',
+    signup_at REAL NOT NULL,
+    invitee_created_at REAL DEFAULT 0,
+    signup_ip_hash TEXT DEFAULT '',
+    signup_fp_hash TEXT DEFAULT '',
+    profile_completed_at REAL DEFAULT 0,
+    profile_completed_ref TEXT DEFAULT '',
+    first_public_video_at REAL DEFAULT 0,
+    first_public_video_ref TEXT DEFAULT '',
+    first_rtc_native_action_at REAL DEFAULT 0,
+    first_rtc_native_action_ref TEXT DEFAULT '',
+    fully_activated_at REAL DEFAULT 0,
+    review_status TEXT DEFAULT 'pending',
+    reviewed_at REAL DEFAULT 0,
+    reviewer_note TEXT DEFAULT '',
+    suspicious_notes TEXT DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (referral_code) REFERENCES referral_codes(code),
+    FOREIGN KEY (referrer_agent_id) REFERENCES agents(id),
+    FOREIGN KEY (invitee_agent_id) REFERENCES agents(id)
+);
+CREATE INDEX IF NOT EXISTS idx_referral_invites_referrer ON referral_invites(referrer_agent_id, signup_at DESC);
+CREATE INDEX IF NOT EXISTS idx_referral_invites_track ON referral_invites(invitee_track, review_status, signup_at DESC);
+CREATE INDEX IF NOT EXISTS idx_referral_invites_code ON referral_invites(referral_code, signup_at DESC);
 """
 
 
@@ -1308,6 +1732,7 @@ def init_db():
         "is_banned": "ALTER TABLE agents ADD COLUMN is_banned INTEGER DEFAULT 0",
         "ban_reason": "ALTER TABLE agents ADD COLUMN ban_reason TEXT DEFAULT ''",
         "banned_at": "ALTER TABLE agents ADD COLUMN banned_at REAL DEFAULT 0",
+        "detected_type": "ALTER TABLE agents ADD COLUMN detected_type TEXT DEFAULT ''",
         # RustChain on-chain address (RTC... Ed25519-derived)
         "rtc_wallet": "ALTER TABLE agents ADD COLUMN rtc_wallet TEXT DEFAULT ''",
         # Referrals (best-effort growth tracking)
@@ -1337,6 +1762,9 @@ def init_db():
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_codes_agent ON referral_codes(agent_id)")
+    referral_code_cols = {row[1] for row in conn.execute("PRAGMA table_info(referral_codes)").fetchall()}
+    if "allowed_track" not in referral_code_cols:
+        conn.execute("ALTER TABLE referral_codes ADD COLUMN allowed_track TEXT DEFAULT 'both'")
 
     # Referral unique hit tracking (privacy: store only hashed fingerprints)
     conn.execute(
@@ -1352,6 +1780,79 @@ def init_db():
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_hit_code ON referral_hit_uniques(code)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referral_invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referral_code TEXT NOT NULL,
+            referrer_agent_id INTEGER NOT NULL,
+            invitee_agent_id INTEGER NOT NULL UNIQUE,
+            invitee_track TEXT NOT NULL DEFAULT 'agent',
+            source TEXT DEFAULT '',
+            signup_at REAL NOT NULL,
+            invitee_created_at REAL DEFAULT 0,
+            signup_ip_hash TEXT DEFAULT '',
+            signup_fp_hash TEXT DEFAULT '',
+            profile_completed_at REAL DEFAULT 0,
+            profile_completed_ref TEXT DEFAULT '',
+            first_public_video_at REAL DEFAULT 0,
+            first_public_video_ref TEXT DEFAULT '',
+            first_rtc_native_action_at REAL DEFAULT 0,
+            first_rtc_native_action_ref TEXT DEFAULT '',
+            fully_activated_at REAL DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
+            reviewed_at REAL DEFAULT 0,
+            reviewer_note TEXT DEFAULT '',
+            suspicious_notes TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (referral_code) REFERENCES referral_codes(code),
+            FOREIGN KEY (referrer_agent_id) REFERENCES agents(id),
+            FOREIGN KEY (invitee_agent_id) REFERENCES agents(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_invites_referrer ON referral_invites(referrer_agent_id, signup_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_invites_track ON referral_invites(invitee_track, review_status, signup_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_invites_code ON referral_invites(referral_code, signup_at DESC)")
+
+    now = time.time()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO referral_invites (
+            referral_code,
+            referrer_agent_id,
+            invitee_agent_id,
+            invitee_track,
+            source,
+            signup_at,
+            invitee_created_at,
+            review_status,
+            created_at,
+            updated_at
+        )
+        SELECT
+            a.referred_by_code,
+            rc.agent_id,
+            a.id,
+            CASE WHEN COALESCE(a.is_human, 0) = 1 THEN 'human' ELSE 'agent' END,
+            'legacy_backfill',
+            CASE
+                WHEN COALESCE(a.referred_at, 0) > 0 THEN a.referred_at
+                WHEN COALESCE(a.created_at, 0) > 0 THEN a.created_at
+                ELSE ?
+            END,
+            COALESCE(a.created_at, 0),
+            'pending',
+            ?,
+            ?
+        FROM agents a
+        JOIN referral_codes rc ON rc.code = a.referred_by_code
+        WHERE COALESCE(a.referred_by_code, '') != ''
+        """,
+        (now, now, now),
+    )
 
     # Migration: Google OAuth columns on agents
     google_migrations = {
@@ -2080,6 +2581,9 @@ def _handle_onchain_tip(
     if user_message:
         what += f': "{user_message}"'
     notify(db, recipient_id, "tip", what, from_agent=sender_name, video_id=video_id or "")
+    evidence_ref = f"/watch/{video_id}" if video_id else f"/agent/{recipient_name}"
+    _referral_mark_rtc_native_action(db, sender_id, evidence_ref=evidence_ref)
+    _referral_mark_rtc_native_action(db, recipient_id, evidence_ref=evidence_ref)
 
     return {
         "ok": True,
@@ -3530,6 +4034,15 @@ def register_agent():
         return jsonify({
             "error": "agent_name must be 2-32 chars, lowercase alphanumeric, hyphens, underscores"
         }), 400
+    if ref_code:
+        ref = _referral_get_code_row(get_db(), ref_code)
+        if not ref:
+            return jsonify({"error": "Referral code not found"}), 400
+        if not _referral_track_allowed(ref["allowed_track"], "agent"):
+            return jsonify({
+                "error": "Referral code is not enabled for agent onboarding",
+                "allowed_track": _normalize_referral_track(ref["allowed_track"], "both"),
+            }), 400
 
     display_name = data.get("display_name", agent_name).strip()[:MAX_DISPLAY_NAME_LENGTH]
     bio = data.get("bio", "").strip()[:MAX_BIO_LENGTH]
@@ -3558,7 +4071,7 @@ def register_agent():
         )
         new_agent_id = int(cur.lastrowid)
         if ref_code:
-            _referral_apply_signup(db, new_agent_id, ref_code)
+            _referral_apply_signup(db, new_agent_id, ref_code, source="agent_api_register")
         _refresh_agent_quests(db, new_agent_id, ["profile_complete"])
         db.commit()
     except sqlite3.IntegrityError:
@@ -3686,7 +4199,7 @@ def login():
 def signup():
     """Signup page for human users."""
     if request.method == "GET":
-        ref_code = _normalize_ref_code(request.args.get("ref", ""))
+        ref_code = _normalize_ref_code(request.args.get("ref", "") or session.get("ref_code", ""))
         if ref_code:
             session["ref_code"] = ref_code
         referral = None
@@ -3707,7 +4220,13 @@ def signup():
                     "agent_name": row["agent_name"],
                     "display_name": row["display_name"] or row["agent_name"],
                 }
-        return render_template("login.html", signup=True, form_ts=time.time(), referral=referral)
+        return render_template(
+            "login.html",
+            signup=True,
+            form_ts=time.time(),
+            referral=referral,
+            referral_code_value=ref_code,
+        )
 
     _verify_csrf()
 
@@ -3730,36 +4249,46 @@ def signup():
     ip = _get_client_ip()
     if not _rate_limit(f"signup:{ip}", 3, 3600):
         flash("Too many signups. Try again later.", "error")
-        return render_template("login.html", signup=True, form_ts=time.time()), 429
+        return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=""), 429
 
     username = request.form.get("username", "").strip().lower()
     display_name = request.form.get("display_name", "").strip()[:MAX_DISPLAY_NAME_LENGTH]
     password = request.form.get("password", "")
     confirm = request.form.get("confirm_password", "")
     email = request.form.get("email", "").strip().lower()
+    ref_code = _normalize_ref_code(request.form.get("ref_code", "") or session.get("ref_code", ""))
 
     if not username or not password:
         flash("Username and password are required.", "error")
-        return render_template("login.html", signup=True, form_ts=time.time()), 400
+        return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
 
     if not re.match(r"^[a-z0-9_-]{2,32}$", username):
         flash("Username must be 2-32 chars, lowercase, alphanumeric, hyphens, underscores.", "error")
-        return render_template("login.html", signup=True, form_ts=time.time()), 400
+        return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
 
     if len(password) < 8:
         flash("Password must be at least 8 characters.", "error")
-        return render_template("login.html", signup=True, form_ts=time.time()), 400
+        return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
 
     if password != confirm:
         flash("Passwords do not match.", "error")
-        return render_template("login.html", signup=True, form_ts=time.time()), 400
+        return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
+
+    if ref_code:
+        ref = _referral_get_code_row(get_db(), ref_code)
+        if not ref:
+            flash("Referral code not found.", "error")
+            return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
+        if not _referral_track_allowed(ref["allowed_track"], "human"):
+            flash("Referral code is not enabled for human signups.", "error")
+            return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
 
     # Basic email validation (optional field)
     email_token = ""
     if email:
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
             flash("Invalid email address.", "error")
-            return render_template("login.html", signup=True, form_ts=time.time()), 400
+            return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 400
         email_token = secrets.token_hex(32)
 
     api_key = gen_api_key()
@@ -3783,13 +4312,14 @@ def signup():
              now, now),
         )
         new_user_id = int(cur.lastrowid)
-        ref_code = _normalize_ref_code(session.pop("ref_code", ""))
         if ref_code:
-            _referral_apply_signup(db, new_user_id, ref_code)
+            _referral_apply_signup(db, new_user_id, ref_code, source="human_signup_form")
         db.commit()
     except sqlite3.IntegrityError:
         flash(f"Username '{username}' is already taken.", "error")
-        return render_template("login.html", signup=True, form_ts=time.time()), 409
+        return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=ref_code), 409
+
+    session.pop("ref_code", None)
 
     # Send verification email if provided
     if email and email_token:
@@ -3852,39 +4382,64 @@ def referral_redirect(code):
     )
 
 
-@app.route("/api/agents/me/referral", methods=["GET", "POST"])
-@require_api_key
-def referral_me_agent():
-    """Create/get referral code for the authenticated agent (API key)."""
+def _referral_me_payload() -> Response:
+    """Create/get referral code for the current authenticated account."""
     db = get_db()
     agent_id = int(g.agent["id"])
+    data = {}
+    if request.method == "POST":
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+    requested_track = _normalize_referral_track(data.get("allowed_track", data.get("track", "both")), "both")
+    requested_code = _normalize_ref_code(data.get("code", ""))
     # Prefer an existing code for this agent.
     row = db.execute(
-        "SELECT code, hits, signups, first_uploads, created_at FROM referral_codes WHERE agent_id = ? ORDER BY created_at ASC LIMIT 1",
+        """
+        SELECT code, hits, signups, first_uploads, created_at, COALESCE(allowed_track, 'both') AS allowed_track
+        FROM referral_codes
+        WHERE agent_id = ?
+        ORDER BY created_at ASC
+        LIMIT 1
+        """,
         (agent_id,),
     ).fetchone()
     if row:
         code = row["code"]
+        if request.method == "POST":
+            if requested_code and requested_code != row["code"]:
+                return jsonify({"error": "Referral code already exists for this account"}), 409
+            current_track = _normalize_referral_track(row["allowed_track"], "both")
+            if requested_track != current_track:
+                db.execute(
+                    "UPDATE referral_codes SET allowed_track = ? WHERE code = ?",
+                    (requested_track, row["code"]),
+                )
+                db.commit()
     else:
         # Default code: agent name (validated) or random token.
-        base = _normalize_ref_code(g.agent["agent_name"])
+        base = requested_code or _normalize_ref_code(g.agent["agent_name"])
         code = base or (secrets.token_hex(4))
         # Ensure uniqueness.
         while db.execute("SELECT 1 FROM referral_codes WHERE code = ?", (code,)).fetchone():
             code = secrets.token_hex(4)
         db.execute(
-            "INSERT INTO referral_codes (code, agent_id, created_at) VALUES (?, ?, ?)",
-            (code, agent_id, time.time()),
+            "INSERT INTO referral_codes (code, agent_id, created_at, allowed_track) VALUES (?, ?, ?, ?)",
+            (code, agent_id, time.time(), requested_track),
         )
         db.commit()
         row = db.execute(
-            "SELECT code, hits, signups, first_uploads, created_at FROM referral_codes WHERE code = ?",
+            """
+            SELECT code, hits, signups, first_uploads, created_at, COALESCE(allowed_track, 'both') AS allowed_track
+            FROM referral_codes
+            WHERE code = ?
+            """,
             (code,),
         ).fetchone()
 
+    summary = _referral_build_summary(db, agent_id)
     return jsonify({
         "ok": True,
         "code": row["code"],
+        "allowed_track": _normalize_referral_track(row["allowed_track"], "both"),
         "ref_url": f"https://bottube.ai/r/{row['code']}",
         "signup_url": f"https://bottube.ai/signup?ref={row['code']}",
         "stats": {
@@ -3893,7 +4448,15 @@ def referral_me_agent():
             "first_uploads": int(row["first_uploads"] or 0),
             "created_at": row["created_at"],
         },
+        "summary": summary,
     })
+
+
+@app.route("/api/agents/me/referral", methods=["GET", "POST"])
+@require_api_key
+def referral_me_agent():
+    """Create/get referral code for the authenticated agent (API key)."""
+    return _referral_me_payload()
 
 
 @app.route("/api/users/me/referral", methods=["GET", "POST"])
@@ -3903,7 +4466,35 @@ def referral_me_user():
         return jsonify({"error": "Not logged in"}), 401
     # Reuse same logic as agent endpoint by binding g.agent temporarily.
     g.agent = g.user
-    return referral_me_agent()
+    return _referral_me_payload()
+
+
+def _referral_apply_payload(source: str):
+    db = get_db()
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    ref_code = _normalize_ref_code(data.get("ref_code", "") or data.get("ref", ""))
+    if not ref_code:
+        return jsonify({"error": "ref_code is required"}), 400
+    result = _referral_apply_signup(db, int(g.agent["id"]), ref_code, source=source)
+    status = 200 if result.get("applied") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/agents/me/referral/apply", methods=["POST"])
+@require_api_key
+def referral_apply_agent():
+    """Attach an invite code to the current account if it has not been referred yet."""
+    return _referral_apply_payload("manual_apply_api")
+
+
+@app.route("/api/users/me/referral/apply", methods=["POST"])
+def referral_apply_user():
+    """Session-auth version of referral apply for humans."""
+    if not g.user:
+        return jsonify({"error": "Not logged in"}), 401
+    _verify_csrf()
+    g.agent = g.user
+    return _referral_apply_payload("manual_apply_web")
 
 
 def _get_referral_leaderboard(db, limit: int = 50) -> list[dict]:
@@ -3959,6 +4550,270 @@ def referrals_leaderboard_api():
     except Exception:
         limit_i = 50
     return jsonify({"ok": True, "leaderboard": _get_referral_leaderboard(db, limit=limit_i)})
+
+
+def _referral_admin_notes(db: sqlite3.Connection, row: sqlite3.Row) -> list[str]:
+    notes: list[str] = []
+    signup_ip_hash = (row["signup_ip_hash"] or "").strip()
+    signup_fp_hash = (row["signup_fp_hash"] or "").strip()
+    if signup_ip_hash:
+        shared_ip = int(
+            db.execute(
+                "SELECT COUNT(*) FROM referral_invites WHERE signup_ip_hash = ?",
+                (signup_ip_hash,),
+            ).fetchone()[0]
+            or 0
+        )
+        if shared_ip > 1:
+            notes.append(f"shared_signup_ip_hash:{shared_ip}")
+    if signup_fp_hash:
+        shared_fp = int(
+            db.execute(
+                "SELECT COUNT(*) FROM referral_invites WHERE signup_fp_hash = ?",
+                (signup_fp_hash,),
+            ).fetchone()[0]
+            or 0
+        )
+        if shared_fp > 1:
+            notes.append(f"shared_signup_fingerprint:{shared_fp}")
+    if (row["review_status"] or "pending") == "pending" and float(row["fully_activated_at"] or 0) > 0:
+        notes.append("ready_for_review")
+    if (row["suspicious_notes"] or "").strip():
+        notes.append((row["suspicious_notes"] or "").strip())
+    allowed_track = _normalize_referral_track(row["allowed_track"], "both")
+    invitee_track = (row["invitee_track"] or "agent").strip().lower()
+    if not _referral_track_allowed(allowed_track, invitee_track):
+        notes.append(f"track_mismatch:{allowed_track}->{invitee_track}")
+    return notes
+
+
+def _referral_admin_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    invitee_created_at = float(row["invitee_created_at"] or 0)
+    return {
+        "id": int(row["id"]),
+        "referral_code": row["referral_code"],
+        "allowed_track": _normalize_referral_track(row["allowed_track"], "both"),
+        "source": row["source"] or "",
+        "referrer": {
+            "agent_name": row["referrer_name"],
+            "display_name": row["referrer_display_name"] or row["referrer_name"],
+        },
+        "invitee": {
+            "agent_name": row["invitee_name"],
+            "display_name": row["invitee_display_name"] or row["invitee_name"],
+            "track": row["invitee_track"],
+            "created_at": invitee_created_at,
+            "account_age_days": round(max(time.time() - invitee_created_at, 0) / 86400.0, 2) if invitee_created_at > 0 else 0.0,
+        },
+        "signup_at": float(row["signup_at"] or 0),
+        "review_status": (row["review_status"] or "pending").strip().lower() or "pending",
+        "reviewed_at": float(row["reviewed_at"] or 0),
+        "reviewer_note": row["reviewer_note"] or "",
+        "milestones": {
+            "profile_completed": {
+                "done": float(row["profile_completed_at"] or 0) > 0,
+                "at": float(row["profile_completed_at"] or 0),
+                "evidence_ref": row["profile_completed_ref"] or "",
+            },
+            "first_public_video": {
+                "done": float(row["first_public_video_at"] or 0) > 0,
+                "at": float(row["first_public_video_at"] or 0),
+                "evidence_ref": row["first_public_video_ref"] or "",
+            },
+            "first_rtc_native_action": {
+                "done": float(row["first_rtc_native_action_at"] or 0) > 0,
+                "at": float(row["first_rtc_native_action_at"] or 0),
+                "evidence_ref": row["first_rtc_native_action_ref"] or "",
+            },
+            "fully_activated": {
+                "done": float(row["fully_activated_at"] or 0) > 0,
+                "at": float(row["fully_activated_at"] or 0),
+            },
+        },
+        "suspicious_notes": _referral_admin_notes(db, row),
+    }
+
+
+@app.route("/api/admin/referrals")
+def admin_referrals():
+    """Admin review queue for human/agent referral funnels."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    status_filter = (request.args.get("status", "") or "").strip().lower()
+    track_filter = (request.args.get("track", "") or "").strip().lower()
+    ref_code = _normalize_ref_code(request.args.get("code", ""))
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = min(100, max(1, request.args.get("per_page", 20, type=int)))
+    offset = (page - 1) * per_page
+
+    where = ["1 = 1"]
+    params: list[object] = []
+    if status_filter:
+        where.append("ri.review_status = ?")
+        params.append(status_filter)
+    if track_filter in {"human", "agent"}:
+        where.append("ri.invitee_track = ?")
+        params.append(track_filter)
+    if ref_code:
+        where.append("ri.referral_code = ?")
+        params.append(ref_code)
+
+    where_sql = " AND ".join(where)
+    rows = db.execute(
+        f"""
+        SELECT
+            ri.*,
+            COALESCE(rc.allowed_track, 'both') AS allowed_track,
+            ref.agent_name AS referrer_name,
+            ref.display_name AS referrer_display_name,
+            inv.agent_name AS invitee_name,
+            inv.display_name AS invitee_display_name,
+            inv.created_at AS invitee_created_at
+        FROM referral_invites ri
+        JOIN agents ref ON ref.id = ri.referrer_agent_id
+        JOIN agents inv ON inv.id = ri.invitee_agent_id
+        LEFT JOIN referral_codes rc ON rc.code = ri.referral_code
+        WHERE {where_sql}
+        ORDER BY ri.signup_at DESC, ri.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        params + [per_page, offset],
+    ).fetchall()
+    total = int(
+        db.execute(
+            f"SELECT COUNT(*) FROM referral_invites ri WHERE {where_sql}",
+            params,
+        ).fetchone()[0]
+        or 0
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "referrals": [_referral_admin_payload(db, row) for row in rows],
+        }
+    )
+
+
+@app.route("/api/admin/referrals/<int:invite_id>/review", methods=["POST"])
+def admin_review_referral(invite_id):
+    """Approve, reject, void, or reset a referral invite."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    invite = db.execute("SELECT id FROM referral_invites WHERE id = ?", (invite_id,)).fetchone()
+    if not invite:
+        return jsonify({"error": "Referral invite not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    action = (data.get("action", "pending") or "pending").strip().lower()
+    if action not in {"pending", "approve", "approved", "reject", "rejected", "void"}:
+        return jsonify({"error": "Invalid action. Use pending, approve, reject, or void."}), 400
+
+    new_status = {
+        "approve": "approved",
+        "approved": "approved",
+        "reject": "rejected",
+        "rejected": "rejected",
+        "void": "void",
+        "pending": "pending",
+    }[action]
+    reviewer_note = (data.get("note", "") or "").strip()[:2000]
+    now = time.time()
+    db.execute(
+        """
+        UPDATE referral_invites
+        SET review_status = ?, reviewed_at = ?, reviewer_note = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_status, now, reviewer_note, now, invite_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "id": invite_id, "review_status": new_status})
+
+
+@app.route("/api/admin/referrals/export")
+def admin_export_referrals():
+    """Export payout-ready referral rows for manual bounty settlement."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    fmt = (request.args.get("format", "json") or "json").strip().lower()
+    rows = db.execute(
+        """
+        SELECT
+            ri.*,
+            COALESCE(rc.allowed_track, 'both') AS allowed_track,
+            ref.agent_name AS referrer_name,
+            ref.display_name AS referrer_display_name,
+            inv.agent_name AS invitee_name,
+            inv.display_name AS invitee_display_name,
+            inv.created_at AS invitee_created_at
+        FROM referral_invites ri
+        JOIN agents ref ON ref.id = ri.referrer_agent_id
+        JOIN agents inv ON inv.id = ri.invitee_agent_id
+        LEFT JOIN referral_codes rc ON rc.code = ri.referral_code
+        WHERE COALESCE(ri.fully_activated_at, 0) > 0
+          AND COALESCE(ri.review_status, 'pending') NOT IN ('rejected', 'void')
+        ORDER BY ri.fully_activated_at DESC, ri.id DESC
+        """
+    ).fetchall()
+    payload = [_referral_admin_payload(db, row) for row in rows]
+
+    if fmt == "csv":
+        import csv
+        import io
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            [
+                "invite_id",
+                "referral_code",
+                "referrer_agent_name",
+                "invitee_agent_name",
+                "invitee_track",
+                "review_status",
+                "signup_at",
+                "profile_completed_at",
+                "first_public_video_at",
+                "first_rtc_native_action_at",
+                "fully_activated_at",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    int(row["id"]),
+                    row["referral_code"],
+                    row["referrer_name"],
+                    row["invitee_name"],
+                    row["invitee_track"],
+                    (row["review_status"] or "pending"),
+                    float(row["signup_at"] or 0),
+                    float(row["profile_completed_at"] or 0),
+                    float(row["first_public_video_at"] or 0),
+                    float(row["first_rtc_native_action_at"] or 0),
+                    float(row["fully_activated_at"] or 0),
+                ]
+            )
+        return Response(
+            buf.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=referral-export.csv"},
+        )
+
+    return jsonify({"ok": True, "count": len(payload), "rows": payload})
 
 
 @app.route("/verify-email/<token>")
@@ -4038,6 +4893,10 @@ def google_auth():
     if not GOOGLE_CLIENT_ID:
         flash("Google sign-in is not configured.", "error")
         return redirect(url_for("login"))
+
+    ref_code = _normalize_ref_code(request.args.get("ref", "") or session.get("ref_code", ""))
+    if ref_code:
+        session["ref_code"] = ref_code
 
     # Generate state token for CSRF protection
     state = secrets.token_hex(16)
@@ -4188,6 +5047,10 @@ def google_callback():
         (username, display_name, api_key, google_email, google_id, google_email,
          google_avatar, google_avatar, now, now),
     )
+    new_user_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+    ref_code = _normalize_ref_code(session.pop("ref_code", ""))
+    if ref_code:
+        _referral_apply_signup(db, new_user_id, ref_code, source="google_oauth_signup")
     db.commit()
 
     new_user = db.execute("SELECT * FROM agents WHERE agent_name = ?", (username,)).fetchone()
@@ -4434,6 +5297,7 @@ def upload_video():
     award_rtc(db, g.agent["id"], RTC_REWARD_UPLOAD, "video_upload", video_id)
     _referral_mark_first_upload(db, g.agent["id"])
     _refresh_agent_quests(db, g.agent["id"], ["first_upload"])
+    _referral_refresh_invite_state(db, g.agent["id"])
     db.commit()
 
     # Generate captions from the finalized video asset in the background.
@@ -6424,6 +7288,7 @@ def update_profile():
     vals = list(updates.values()) + [g.agent["id"]]
     db.execute(f"UPDATE agents SET {set_clause} WHERE id = ?", vals)
     _refresh_agent_quests(db, g.agent["id"], ["profile_complete"])
+    _referral_refresh_invite_state(db, g.agent["id"])
     db.commit()
 
     agent = db.execute("SELECT * FROM agents WHERE id = ?", (g.agent["id"],)).fetchone()
@@ -7315,6 +8180,12 @@ def manage_wallet():
 
     params.append(g.agent["id"])
     db.execute(f"UPDATE agents SET {', '.join(updates)} WHERE id = ?", params)
+    if str(data.get("rtc_wallet", "")).strip():
+        _referral_mark_rtc_native_action(
+            db,
+            int(g.agent["id"]),
+            evidence_ref="/settings/wallet",
+        )
     db.commit()
 
     return jsonify({
@@ -7349,6 +8220,12 @@ def manage_wallet_web():
 
     db = get_db()
     db.execute("UPDATE agents SET rtc_wallet = ? WHERE id = ?", (rtc_wallet, g.user["id"]))
+    if rtc_wallet:
+        _referral_mark_rtc_native_action(
+            db,
+            int(g.user["id"]),
+            evidence_ref="/settings/wallet",
+        )
     db.commit()
     return jsonify({"ok": True, "rtc_wallet": rtc_wallet})
 
@@ -7485,6 +8362,8 @@ def tip_video(video_id):
            f'@{g.agent["agent_name"]} tipped {amount:.4f} RTC on "{video["title"]}"'
            + (f': "{message}"' if message else ""),
            from_agent=g.agent["agent_name"], video_id=video_id)
+    _referral_mark_rtc_native_action(db, int(g.agent["id"]), evidence_ref=f"/watch/{video_id}")
+    _referral_mark_rtc_native_action(db, int(video["agent_id"]), evidence_ref=f"/watch/{video_id}")
 
     db.commit()
     return jsonify({"ok": True, "amount": amount, "video_id": video_id,
@@ -7577,6 +8456,8 @@ def web_tip_video(video_id):
            f'@{g.user["agent_name"]} tipped {amount:.4f} RTC on "{video["title"]}"'
            + (f': "{message}"' if message else ""),
            from_agent=g.user["agent_name"], video_id=video_id)
+    _referral_mark_rtc_native_action(db, int(g.user["id"]), evidence_ref=f"/watch/{video_id}")
+    _referral_mark_rtc_native_action(db, int(video["agent_id"]), evidence_ref=f"/watch/{video_id}")
 
     db.commit()
     new_balance = db.execute("SELECT rtc_balance FROM agents WHERE id = ?", (g.user["id"],)).fetchone()
@@ -7664,6 +8545,8 @@ def web_tip_agent(agent_name):
            f'@{g.user["agent_name"]} tipped {amount:.4f} RTC'
            + (f': "{message}"' if message else ""),
            from_agent=g.user["agent_name"], video_id="")
+    _referral_mark_rtc_native_action(db, int(g.user["id"]), evidence_ref=f"/agent/{agent_name}")
+    _referral_mark_rtc_native_action(db, int(target["id"]), evidence_ref=f"/agent/{agent_name}")
 
     db.commit()
     new_balance = db.execute("SELECT rtc_balance FROM agents WHERE id = ?", (g.user["id"],)).fetchone()
@@ -7747,6 +8630,8 @@ def tip_agent(agent_name):
            f'@{g.agent["agent_name"]} tipped {amount:.4f} RTC'
            + (f': "{message}"' if message else ""),
            from_agent=g.agent["agent_name"], video_id="")
+    _referral_mark_rtc_native_action(db, int(g.agent["id"]), evidence_ref=f"/agent/{agent_name}")
+    _referral_mark_rtc_native_action(db, int(target["id"]), evidence_ref=f"/agent/{agent_name}")
 
     db.commit()
     return jsonify({"ok": True, "amount": amount, "to": target["agent_name"], "message": message})
@@ -8187,6 +9072,7 @@ def upload_avatar():
     db = get_db()
     db.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (avatar_url, agent["id"]))
     _refresh_agent_quests(db, agent["id"], ["profile_complete"])
+    _referral_refresh_invite_state(db, agent["id"])
     db.commit()
 
     return jsonify({"ok": True, "avatar_url": avatar_url})
@@ -8869,18 +9755,17 @@ def dashboard_page():
     db = get_db()
     uid = g.user["id"]
 
-    # Referral stats for the current user (best-effort; may be empty if no code created yet).
-    referral = db.execute(
-        "SELECT code, hits, signups, first_uploads FROM referral_codes WHERE agent_id = ? ORDER BY created_at ASC LIMIT 1",
-        (uid,),
-    ).fetchone()
-    referral_data = {
-        "code": referral["code"],
-        "ref_url": f"https://bottube.ai/r/{referral['code']}",
-        "hits": int(referral["hits"] or 0),
-        "signups": int(referral["signups"] or 0),
-        "first_uploads": int(referral["first_uploads"] or 0),
-    } if referral else None
+    referral_data = _referral_build_summary(db, uid)
+    if not referral_data:
+        code = _normalize_ref_code(g.user["agent_name"]) or secrets.token_hex(4)
+        while db.execute("SELECT 1 FROM referral_codes WHERE code = ?", (code,)).fetchone():
+            code = secrets.token_hex(4)
+        db.execute(
+            "INSERT INTO referral_codes (code, agent_id, created_at, allowed_track) VALUES (?, ?, ?, 'both')",
+            (code, uid, time.time()),
+        )
+        db.commit()
+        referral_data = _referral_build_summary(db, uid)
 
     # Your videos with stats
     videos = db.execute(
@@ -9448,6 +10333,8 @@ def upload_page():
          thumb_filename, duration, width, height, json.dumps(tags), category, time.time()),
     )
     award_rtc(db, g.user["id"], RTC_REWARD_UPLOAD, "video_upload", video_id)
+    _referral_mark_first_upload(db, g.user["id"])
+    _referral_refresh_invite_state(db, g.user["id"])
     db.commit()
 
     # Generate captions from the finalized video asset in the background.
