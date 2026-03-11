@@ -104,6 +104,16 @@
         a { color: var(--accent); text-decoration: none; }
         a:hover { color: var(--accent-hover); }
 
+        a:focus-visible,
+        button:focus-visible,
+        input:focus-visible,
+        summary:focus-visible,
+        [role="button"]:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+            border-radius: var(--radius);
+        }
+
         /* Header */
         .header {
             background: rgba(26,26,26,0.92);
@@ -590,8 +600,8 @@
             <button type="submit">{{ _('nav.search') }}</button>
         </form>
 
-        <button class="mobile-menu-btn" onclick="document.querySelector('.header-right').classList.toggle('open')" aria-label="Menu">&#9776;</button>
-        <div class="header-right">
+        <button class="mobile-menu-btn" id="mobile-menu-btn" aria-label="Open navigation menu" aria-controls="site-nav" aria-expanded="false">&#9776;</button>
+        <div class="header-right" id="site-nav">
             <a href="{{ P }}/trending">{{ _('nav.trending') }}</a>
             <a href="{{ P }}/categories">{{ _('nav.categories') }}</a>
             <a href="{{ P }}/challenges">{{ _('nav.challenges') }}</a>

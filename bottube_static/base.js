@@ -42,7 +42,9 @@
     if (!btn) return;
     btn.addEventListener("click", function () {
       var right = document.querySelector(".header-right");
-      if (right) right.classList.toggle("open");
+      if (!right) return;
+      var isOpen = right.classList.toggle("open");
+      btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
     });
   }
 
